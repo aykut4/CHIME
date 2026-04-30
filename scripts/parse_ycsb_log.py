@@ -4,23 +4,20 @@
 Emits one CSV row to stdout:
     workload,threads,coros,nodes,duration_s,total_ops,throughput_mops,p50_us,p95_us,p99_us,p999_us
 
-Throughput is computed as (sum of `cluster throughput X.XXX Mops` across all
-benchmark epochs) divided by epoch count. Duration is epoch_count * EPOCH_LEN
-where EPOCH_LEN is read from the log if present (default 0.2s for
-SHORT_TEST_EPOCH builds).
+Throughput is computed as the average of `cluster throughput X.XXX Mops` over
+all benchmark epochs (warmup epoch dropped). Duration is epoch_count * EPOCH_LEN.
 
 Latency percentiles are aggregated over every `epoch_*.lat` file in --lat-dir;
-each line is `<bucket_us>\t<count>` and bucket size is 0.1us.
-"""
+each line is `<bucket_us>\t<count>` where bucket size is 0.1us.
 
-from __future__ import annotations
+Compatible with Python 3.6+ (no PEP 563/585 syntax).
+"""
 
 import argparse
 import glob
 import os
 import re
 import sys
-from typing import List, Tuple
 
 
 CLUSTER_TP_RE = re.compile(r"cluster throughput\s+([0-9.]+)\s+Mops")
@@ -28,9 +25,9 @@ WARMUP_RE = re.compile(r"warmup time\s+([0-9.]+)s")
 EPOCH_RE = re.compile(r"epoch\s+(\d+)\s+passed")
 
 
-def parse_log(log_path: str) -> Tuple[float, int]:
+def parse_log(log_path):
     """Returns (avg_throughput_mops, n_epochs)."""
-    tps: List[float] = []
+    tps = []
     n_epochs = 0
     with open(log_path, "r", errors="replace") as f:
         for line in f:
@@ -42,7 +39,6 @@ def parse_log(log_path: str) -> Tuple[float, int]:
                 n_epochs = max(n_epochs, int(m2.group(1)))
     if not tps:
         return 0.0, n_epochs
-    # drop the 1st epoch (warmup of cache+JIT effects)
     if len(tps) >= 3:
         useful = tps[1:]
     else:
@@ -50,7 +46,7 @@ def parse_log(log_path: str) -> Tuple[float, int]:
     return sum(useful) / len(useful), n_epochs
 
 
-def percentile(buckets: List[Tuple[float, int]], pct: float) -> float:
+def percentile(buckets, pct):
     total = sum(c for _, c in buckets)
     if total == 0:
         return float("nan")
@@ -63,15 +59,14 @@ def percentile(buckets: List[Tuple[float, int]], pct: float) -> float:
     return buckets[-1][0]
 
 
-def parse_lat_dir(lat_dir: str) -> List[Tuple[float, int]]:
-    """Aggregates all per-epoch latency histograms (drops the very first epoch
-    so warmup spikes don't dominate)."""
+def parse_lat_dir(lat_dir):
+    """Aggregate per-epoch latency histograms (drops 1st epoch as warmup)."""
     files = sorted(glob.glob(os.path.join(lat_dir, "epoch_*.lat")))
     if not files:
         return []
     if len(files) >= 3:
-        files = files[1:]  # drop warmup
-    bucket_to_count: dict[float, int] = {}
+        files = files[1:]
+    bucket_to_count = {}
     for fp in files:
         with open(fp, "r", errors="replace") as f:
             for line in f:
@@ -92,7 +87,7 @@ def parse_lat_dir(lat_dir: str) -> List[Tuple[float, int]]:
     return sorted(bucket_to_count.items())
 
 
-def main() -> int:
+def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", required=True)
     ap.add_argument("--lat-dir", required=True)
@@ -114,18 +109,21 @@ def main() -> int:
     p99 = percentile(buckets, 99.0)
     p999 = percentile(buckets, 99.9)
 
+    def fmt(x):
+        return ("%.2f" % x) if x == x else "nan"
+
     fields = [
         args.workload,
         args.threads,
         args.coros,
         args.nodes,
-        f"{duration:.2f}",
-        f"{total_ops}",
-        f"{avg_tp:.3f}",
-        f"{p50:.2f}" if p50 == p50 else "nan",
-        f"{p95:.2f}" if p95 == p95 else "nan",
-        f"{p99:.2f}" if p99 == p99 else "nan",
-        f"{p999:.2f}" if p999 == p999 else "nan",
+        "%.2f" % duration,
+        str(total_ops),
+        "%.3f" % avg_tp,
+        fmt(p50),
+        fmt(p95),
+        fmt(p99),
+        fmt(p999),
     ]
     print(",".join(str(x) for x in fields))
     return 0
