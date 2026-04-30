@@ -244,7 +244,8 @@ public:
 inline GlobalAddress DSM::alloc(size_t size, uint8_t align_bit) {
 #ifdef CXL_EMULATION
   (void)align_bit;
-  static std::atomic<uint64_t> cxl_alloc_off{0};
+  // Reserve the first chunk for metadata/root-pointer region.
+  static std::atomic<uint64_t> cxl_alloc_off{define::kChunkSize};
   const uint64_t aligned = ((size + (1ull << CACHELINE_ALIGN_BIT) - 1) >> CACHELINE_ALIGN_BIT) << CACHELINE_ALIGN_BIT;
   uint64_t off = cxl_alloc_off.fetch_add(aligned);
   return GlobalAddress(0, off);
