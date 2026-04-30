@@ -12,6 +12,7 @@
 #include <sstream>
 #include <iomanip>
 #include <random>
+#include <numa.h>
 
 #ifdef LONG_TEST_EPOCH
   #define TEST_EPOCH 40
@@ -197,7 +198,12 @@ void thread_load(int id) {
 
 
 void thread_run(int id) {
-  bindCore(id * 2 + 1);  // bind to CPUs in NUMA that close to mlx5_2
+  const int split = kThreadCount / 2;
+  const int target_node = (id < split) ? 0 : 1;
+  if (numa_run_on_node(target_node) != 0) {
+    perror("numa_run_on_node");
+    assert(false);
+  }
 
   dsm->registerThread();
   uint64_t my_id = kThreadCount * dsm->getMyNodeID() + id;

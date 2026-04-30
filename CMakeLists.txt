@@ -7,7 +7,7 @@ set(CMAKE_C_FLAGS "-Wall -Wno-deprecated-declarations -Wno-unused-variable -Wno-
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++17")
 
 #Link Options
-set(LINKS_FLAGS "-lnuma -lcityhash -lboost_coroutine -lboost_context -lpthread -libverbs -lmemcached -ltbb")
+set(LINKS_FLAGS "-lnuma -lcityhash -lboost_coroutine -lboost_context -lpthread -lmemcached -ltbb")
 
 #Env Options
 option (STATIC_MN_IP "Use static MNs according the IPs of the nodes" OFF)
@@ -19,6 +19,7 @@ option (LONG_TEST_EPOCH "Use big epoch num and long epoch duration" OFF)
 option (ENABLE_CACHE_EVICTION "Turn on cache-eviction" OFF)
 option (READ_DELEGATION "Turn on read delegation technique" ON)
 option (WRITE_COMBINING "Turn on write combining technique" ON)
+option (CXL_EMULATION "Use local-memory CXL emulation instead of RDMA data-path ops" ON)
 
 if(STATIC_MN_IP)
     add_definitions(-DSTATIC_ID_FROM_IP)
@@ -72,6 +73,12 @@ if(WRITE_COMBINING)
     add_definitions(-DTREE_ENABLE_WRITE_COMBINING)
 else()
     remove_definitions(-DTREE_ENABLE_WRITE_COMBINING)
+endif()
+
+if(CXL_EMULATION)
+    add_definitions(-DCXL_EMULATION)
+else()
+    remove_definitions(-DCXL_EMULATION)
 endif()
 
 #Tree Options (compile into CHIME/baselines; these options should be set up one after one; CHIME is the B+ tree that turns on all options)

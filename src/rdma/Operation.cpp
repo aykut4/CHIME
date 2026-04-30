@@ -1,8 +1,17 @@
 #include "Rdma.h"
 
+#include <atomic>
 #include<vector>
 
 int pollWithCQ(ibv_cq *cq, int pollNumber, struct ibv_wc *wc) {
+#ifdef CXL_EMULATION
+  (void)cq;
+  if (wc) {
+    memset(wc, 0, sizeof(*wc));
+    wc->status = IBV_WC_SUCCESS;
+  }
+  return pollNumber;
+#else
   int count = 0;
 
   do {
@@ -27,9 +36,19 @@ int pollWithCQ(ibv_cq *cq, int pollNumber, struct ibv_wc *wc) {
   }
 
   return count;
+#endif
 }
 
 int pollOnce(ibv_cq *cq, int pollNumber, struct ibv_wc *wc) {
+#ifdef CXL_EMULATION
+  (void)cq;
+  (void)pollNumber;
+  if (wc) {
+    memset(wc, 0, sizeof(*wc));
+    wc->status = IBV_WC_SUCCESS;
+  }
+  return 1;
+#else
   int count = ibv_poll_cq(cq, pollNumber, wc);
   if (count <= 0) {
     return 0;
@@ -42,6 +61,7 @@ int pollOnce(ibv_cq *cq, int pollNumber, struct ibv_wc *wc) {
   } else {
     return count;
   }
+#endif
 }
 
 static inline void fillSgeWr(ibv_sge &sg, ibv_send_wr &wr, uint64_t source,
@@ -172,6 +192,15 @@ bool rdmaReceive(ibv_srq *srq, uint64_t source, uint64_t size, uint32_t lkey) {
 // for RC & UC
 bool rdmaRead(ibv_qp *qp, uint64_t source, uint64_t dest, uint64_t size,
               uint32_t lkey, uint32_t remoteRKey, bool signal, uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)lkey;
+  (void)remoteRKey;
+  (void)signal;
+  (void)wrID;
+  memcpy(reinterpret_cast<void *>(source), reinterpret_cast<void *>(dest), size);
+  return true;
+#else
   struct ibv_sge sg;
   struct ibv_send_wr wr;
   struct ibv_send_wr *wrBad;
@@ -193,6 +222,7 @@ bool rdmaRead(ibv_qp *qp, uint64_t source, uint64_t dest, uint64_t size,
     return false;
   }
   return true;
+#endif
 }
 
 
@@ -200,6 +230,16 @@ bool rdmaRead(ibv_qp *qp, uint64_t source, uint64_t dest, uint64_t size,
 bool rdmaWrite(ibv_qp *qp, uint64_t source, uint64_t dest, uint64_t size,
                uint32_t lkey, uint32_t remoteRKey, int32_t imm, bool isSignaled,
                uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)lkey;
+  (void)remoteRKey;
+  (void)imm;
+  (void)isSignaled;
+  (void)wrID;
+  memcpy(reinterpret_cast<void *>(dest), reinterpret_cast<void *>(source), size);
+  return true;
+#else
 
   struct ibv_sge sg;
   struct ibv_send_wr wr;
@@ -231,11 +271,21 @@ bool rdmaWrite(ibv_qp *qp, uint64_t source, uint64_t dest, uint64_t size,
     return false;
   }
   return true;
+#endif
 }
 
 // RC & UC
 bool rdmaFetchAndAdd(ibv_qp *qp, uint64_t source, uint64_t dest, uint64_t add,
                      uint32_t lkey, uint32_t remoteRKey) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)lkey;
+  (void)remoteRKey;
+  auto *dst = reinterpret_cast<std::atomic<uint64_t> *>(dest);
+  uint64_t old = dst->fetch_add(add, std::memory_order_seq_cst);
+  *reinterpret_cast<uint64_t *>(source) = old;
+  return true;
+#else
   struct ibv_sge sg;
   struct ibv_send_wr wr;
   struct ibv_send_wr *wrBad;
@@ -254,11 +304,18 @@ bool rdmaFetchAndAdd(ibv_qp *qp, uint64_t source, uint64_t dest, uint64_t add,
     return false;
   }
   return true;
+#endif
 }
 
 bool rdmaFetchAndAddBoundary(ibv_qp *qp, uint64_t source, uint64_t dest,
                              uint64_t add, uint32_t lkey, uint32_t remoteRKey,
                              uint64_t boundary, bool singal, uint64_t wr_id) {
+#ifdef CXL_EMULATION
+  (void)boundary;
+  (void)singal;
+  (void)wr_id;
+  return rdmaFetchAndAdd(qp, source, dest, add, lkey, remoteRKey);
+#else
   struct ibv_sge sg;
   struct ibv_exp_send_wr wr;
   struct ibv_exp_send_wr *wrBad;
@@ -286,6 +343,7 @@ bool rdmaFetchAndAddBoundary(ibv_qp *qp, uint64_t source, uint64_t dest,
     return false;
   }
   return true;
+#endif
 }
 
 
@@ -293,6 +351,18 @@ bool rdmaFetchAndAddBoundary(ibv_qp *qp, uint64_t source, uint64_t dest,
 bool rdmaCompareAndSwap(ibv_qp *qp, uint64_t source, uint64_t dest,
                         uint64_t compare, uint64_t swap, uint32_t lkey,
                         uint32_t remoteRKey, bool signal, uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)lkey;
+  (void)remoteRKey;
+  (void)signal;
+  (void)wrID;
+  auto *dst = reinterpret_cast<std::atomic<uint64_t> *>(dest);
+  uint64_t expected = compare;
+  dst->compare_exchange_strong(expected, swap, std::memory_order_seq_cst);
+  *reinterpret_cast<uint64_t *>(source) = expected;
+  return true;
+#else
   struct ibv_sge sg;
   struct ibv_send_wr wr;
   struct ibv_send_wr *wrBad;
@@ -317,11 +387,32 @@ bool rdmaCompareAndSwap(ibv_qp *qp, uint64_t source, uint64_t dest,
     return false;
   }
   return true;
+#endif
 }
 
 bool rdmaCompareAndSwapMask(ibv_qp *qp, uint64_t source, uint64_t dest,
                             uint64_t compare, uint64_t swap, uint32_t lkey,
                             uint32_t remoteRKey, uint64_t compare_mask, uint64_t swap_mask, bool singal, uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)lkey;
+  (void)remoteRKey;
+  (void)singal;
+  (void)wrID;
+  auto *dst = reinterpret_cast<std::atomic<uint64_t> *>(dest);
+  uint64_t old = dst->load(std::memory_order_seq_cst);
+  while (true) {
+    uint64_t new_val = (old & ~swap_mask) | (swap & swap_mask);
+    if ((old & compare_mask) != (compare & compare_mask)) {
+      break;
+    }
+    if (dst->compare_exchange_weak(old, new_val, std::memory_order_seq_cst)) {
+      break;
+    }
+  }
+  *reinterpret_cast<uint64_t *>(source) = old;
+  return true;
+#else
   struct ibv_sge sg;
   struct ibv_exp_send_wr wr;
   struct ibv_exp_send_wr *wrBad;
@@ -352,11 +443,22 @@ bool rdmaCompareAndSwapMask(ibv_qp *qp, uint64_t source, uint64_t dest,
     return false;
   }
   return true;
+#endif
 }
 
 
 bool rdmaReadBatch(ibv_qp *qp, RdmaOpRegion *ror, int k, bool isSignaled,
                    uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)isSignaled;
+  (void)wrID;
+  for (int i = 0; i < k; ++i) {
+    memcpy(reinterpret_cast<void *>(ror[i].source),
+           reinterpret_cast<void *>(ror[i].dest), ror[i].size);
+  }
+  return true;
+#else
   std::vector<ibv_sge> sg(k);
   std::vector<ibv_send_wr> wr(k);
   struct ibv_send_wr *wrBad;
@@ -383,11 +485,22 @@ bool rdmaReadBatch(ibv_qp *qp, RdmaOpRegion *ror, int k, bool isSignaled,
     return false;
   }
   return true;
+#endif
 }
 
 
 bool rdmaWriteBatch(ibv_qp *qp, RdmaOpRegion *ror, int k, bool isSignaled,
                     uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)isSignaled;
+  (void)wrID;
+  for (int i = 0; i < k; ++i) {
+    memcpy(reinterpret_cast<void *>(ror[i].dest),
+           reinterpret_cast<void *>(ror[i].source), ror[i].size);
+  }
+  return true;
+#else
   std::vector<ibv_sge> sg(k);
   std::vector<ibv_send_wr> wr(k);
   struct ibv_send_wr *wrBad;
@@ -417,11 +530,21 @@ bool rdmaWriteBatch(ibv_qp *qp, RdmaOpRegion *ror, int k, bool isSignaled,
     return false;
   }
   return true;
+#endif
 }
 
 bool rdmaCasRead(ibv_qp *qp, const RdmaOpRegion &cas_ror,
                  const RdmaOpRegion &read_ror, uint64_t compare, uint64_t swap,
                  bool isSignaled, uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)isSignaled;
+  (void)wrID;
+  rdmaCompareAndSwap(nullptr, cas_ror.source, cas_ror.dest, compare, swap, 0, 0, true, 0);
+  memcpy(reinterpret_cast<void *>(read_ror.source),
+         reinterpret_cast<void *>(read_ror.dest), read_ror.size);
+  return true;
+#else
 
   struct ibv_sge sg[2];
   struct ibv_send_wr wr[2];
@@ -451,11 +574,21 @@ bool rdmaCasRead(ibv_qp *qp, const RdmaOpRegion &cas_ror,
     return false;
   }
   return true;
+#endif
 }
 
 bool rdmaReadCas(ibv_qp *qp, const RdmaOpRegion &read_ror,
                  const RdmaOpRegion &cas_ror, uint64_t compare, uint64_t swap,
                  bool isSignaled, uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)isSignaled;
+  (void)wrID;
+  memcpy(reinterpret_cast<void *>(read_ror.source),
+         reinterpret_cast<void *>(read_ror.dest), read_ror.size);
+  rdmaCompareAndSwap(nullptr, cas_ror.source, cas_ror.dest, compare, swap, 0, 0, true, 0);
+  return true;
+#else
 
   struct ibv_sge sg[2];
   struct ibv_send_wr wr[2];
@@ -485,11 +618,21 @@ bool rdmaReadCas(ibv_qp *qp, const RdmaOpRegion &read_ror,
     return false;
   }
   return true;
+#endif
 }
 
 bool rdmaCasWrite(ibv_qp *qp, const RdmaOpRegion &cas_ror,
                   const RdmaOpRegion &write_ror, uint64_t compare, uint64_t swap,
                   bool isSignaled, uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)isSignaled;
+  (void)wrID;
+  rdmaCompareAndSwap(nullptr, cas_ror.source, cas_ror.dest, compare, swap, 0, 0, true, 0);
+  memcpy(reinterpret_cast<void *>(write_ror.dest),
+         reinterpret_cast<void *>(write_ror.source), write_ror.size);
+  return true;
+#else
 
   struct ibv_sge sg[2];
   struct ibv_send_wr wr[2];
@@ -519,11 +662,21 @@ bool rdmaCasWrite(ibv_qp *qp, const RdmaOpRegion &cas_ror,
     return false;
   }
   return true;
+#endif
 }
 
 bool rdmaWriteFaa(ibv_qp *qp, const RdmaOpRegion &write_ror,
                   const RdmaOpRegion &faa_ror, uint64_t add_val,
                   bool isSignaled, uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)isSignaled;
+  (void)wrID;
+  memcpy(reinterpret_cast<void *>(write_ror.dest),
+         reinterpret_cast<void *>(write_ror.source), write_ror.size);
+  rdmaFetchAndAdd(nullptr, faa_ror.source, faa_ror.dest, add_val, 0, 0);
+  return true;
+#else
 
   struct ibv_sge sg[2];
   struct ibv_send_wr wr[2];
@@ -552,11 +705,21 @@ bool rdmaWriteFaa(ibv_qp *qp, const RdmaOpRegion &write_ror,
     return false;
   }
   return true;
+#endif
 }
 
 bool rdmaWriteCas(ibv_qp *qp, const RdmaOpRegion &write_ror,
                   const RdmaOpRegion &cas_ror, uint64_t compare, uint64_t swap,
                   bool isSignaled, uint64_t wrID) {
+#ifdef CXL_EMULATION
+  (void)qp;
+  (void)isSignaled;
+  (void)wrID;
+  memcpy(reinterpret_cast<void *>(write_ror.dest),
+         reinterpret_cast<void *>(write_ror.source), write_ror.size);
+  rdmaCompareAndSwap(nullptr, cas_ror.source, cas_ror.dest, compare, swap, 0, 0, true, 0);
+  return true;
+#else
 
   struct ibv_sge sg[2];
   struct ibv_send_wr wr[2];
@@ -587,4 +750,5 @@ bool rdmaWriteCas(ibv_qp *qp, const RdmaOpRegion &write_ror,
     return false;
   }
   return true;
+#endif
 }

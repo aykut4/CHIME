@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <map>
+#include <numa.h>
 
 thread_local int DSM::thread_id = -1;
 thread_local ThreadConnection *DSM::iCon = nullptr;
@@ -36,7 +37,11 @@ DSM *DSM::getInstance(const DSMConfig &conf) {
 DSM::DSM(const DSMConfig &conf)
     : conf(conf), appID(0), cache(conf.cacheConfig) {
 
-  baseAddr = (uint64_t)hugePageAlloc(conf.dsmSize * define::GB);
+  baseAddr = (uint64_t)numa_alloc_onnode(conf.dsmSize * define::GB, 0);
+  if (!baseAddr) {
+    Debug::notifyError("numa_alloc_onnode failed for DSM base memory");
+    abort();
+  }
 
   Debug::notifyInfo("shared memory size: %dGB, 0x%lx", conf.dsmSize, baseAddr);
   Debug::notifyInfo("rdma cache size: %dGB", conf.cacheConfig.cacheSize);
@@ -56,7 +61,7 @@ DSM::DSM(const DSMConfig &conf)
   keeper->barrier("DSM-init");
 }
 
-DSM::~DSM() { hugePageFree((void *)baseAddr, conf.dsmSize * define::GB); }
+DSM::~DSM() { numa_free((void *)baseAddr, conf.dsmSize * define::GB); }
 
 void DSM::registerThread() {
 
