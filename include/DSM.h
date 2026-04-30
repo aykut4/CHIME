@@ -243,11 +243,23 @@ public:
 
 inline GlobalAddress DSM::alloc(size_t size, uint8_t align_bit) {
 #ifdef CXL_EMULATION
-  (void)align_bit;
   // Reserve the first chunk for metadata/root-pointer region.
+  // [CXL] CRITICAL: must honor align_bit (PACKED_ADDR_ALIGN_BIT=8 for nodes),
+  // otherwise PackedGAddr (which shifts off align_bit lower bits) corrupts the address.
   static std::atomic<uint64_t> cxl_alloc_off{define::kChunkSize};
-  const uint64_t aligned = ((size + (1ull << CACHELINE_ALIGN_BIT) - 1) >> CACHELINE_ALIGN_BIT) << CACHELINE_ALIGN_BIT;
-  uint64_t off = cxl_alloc_off.fetch_add(aligned);
+  const uint64_t align_unit = 1ULL << align_bit;
+  const uint64_t aligned_size = ((size + align_unit - 1) >> align_bit) << align_bit;
+  uint64_t off;
+  while (true) {
+    uint64_t cur = cxl_alloc_off.load(std::memory_order_relaxed);
+    uint64_t aligned_cur = (cur + align_unit - 1) & ~(align_unit - 1);
+    uint64_t next = aligned_cur + aligned_size;
+    if (cxl_alloc_off.compare_exchange_weak(cur, next, std::memory_order_acq_rel,
+                                            std::memory_order_relaxed)) {
+      off = aligned_cur;
+      break;
+    }
+  }
   return GlobalAddress(0, off);
 #else
   thread_local int cur_target_node = (this->getMyThreadID() + this->getMyNodeID()) % MEMORY_NODE_NUM;

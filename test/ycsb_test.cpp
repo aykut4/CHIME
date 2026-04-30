@@ -33,7 +33,7 @@
 #endif
 
 #define MAX_THREAD_REQUEST 10000000
-#define LOAD_HEARTBEAT 5000
+#define LOAD_HEARTBEAT 100
 // #define USE_CORO
 #define EPOCH_LAT_TEST
 #define LOADER_NUM 1 // [CONFIG] 1 for CXL emulation single-node to avoid lock contention during load

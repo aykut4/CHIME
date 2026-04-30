@@ -33,6 +33,17 @@ When `CXL_EMULATION` is enabled:
   - second half of threads -> node 1
 - This emulates local vs remote workers on a dual-socket host.
 
+### 5) Allocator alignment (`include/DSM.h`) — CRITICAL CXL FIX
+The CXL bump allocator now honors the `align_bit` argument. CHIME stores the
+root pointer as a `PackedGAddr`, which shifts away the lower
+`PACKED_ADDR_ALIGN_BIT=8` bits. With the previous 64-byte-only alignment, any
+internal-root address allocated after the first split would silently lose its
+lower 8 bits during the round-trip through `PackedGAddr`, so subsequent
+`get_root_ptr` reads pointed at corrupted memory and the
+`decode_node_versions` re-read loop spun indefinitely. The new allocator
+aligns both the bump cursor and the allocation size to `1 << align_bit`,
+making the round-trip identity for every node address.
+
 ## Build Instructions
 
 ```bash

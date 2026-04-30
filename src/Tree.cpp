@@ -214,6 +214,13 @@ re_acquire:
     std::cout << "is_leaf=" << is_leaf << std::endl;
     assert(false);
   }
+#ifdef CXL_EMULATION
+  if (retry_cnt && (retry_cnt % 100000 == 0)) {
+    fprintf(stderr, "[CXL][lock_node] node=0x%lx is_leaf=%d retry=%lu (likely lock-bit stuck)\n",
+            (unsigned long)node_addr.val, is_leaf, (unsigned long)retry_cnt);
+    fflush(stderr);
+  }
+#endif
 
   if (!acquire_lock(node_addr)){
     if (sink != nullptr) {
