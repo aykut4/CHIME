@@ -76,22 +76,23 @@ void DSM::registerThread() {
   thread_tag = thread_id + (((uint64_t)this->getMyNodeID()) << 32) + 1;
 
 #ifdef CXL_EMULATION
-  static thread_local ThreadConnection cxl_dummy_con{};
+  static thread_local ThreadConnection *cxl_dummy_con = nullptr;
   static thread_local bool cxl_inited = false;
   if (!cxl_inited) {
+    cxl_dummy_con = (ThreadConnection *)calloc(1, sizeof(ThreadConnection));
     for (int i = 0; i < NR_DIRECTORY; ++i) {
-      cxl_dummy_con.data[i] = new ibv_qp *[conf.machineNR];
+      cxl_dummy_con->data[i] = new ibv_qp *[conf.machineNR];
       for (uint32_t n = 0; n < conf.machineNR; ++n) {
-        cxl_dummy_con.data[i][n] = nullptr;
+        cxl_dummy_con->data[i][n] = nullptr;
       }
     }
-    cxl_dummy_con.cacheLKey = 0;
-    cxl_dummy_con.cq = nullptr;
-    cxl_dummy_con.rpc_cq = nullptr;
-    cxl_dummy_con.message = nullptr;
+    cxl_dummy_con->cacheLKey = 0;
+    cxl_dummy_con->cq = nullptr;
+    cxl_dummy_con->rpc_cq = nullptr;
+    cxl_dummy_con->message = nullptr;
     cxl_inited = true;
   }
-  iCon = &cxl_dummy_con;
+  iCon = cxl_dummy_con;
 #else
   iCon = thCon[thread_id];
 
