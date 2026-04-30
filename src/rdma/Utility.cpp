@@ -35,6 +35,10 @@ void rdmaQueryQueuePair(ibv_qp *qp) {
 }
 
 void checkDMSupported(struct ibv_context *ctx) {
+#ifdef CXL_EMULATION
+  (void)ctx;
+  kMaxDeviceMemorySize = 0;
+#else
   struct ibv_exp_device_attr attrs;
 
   attrs.comp_mask = IBV_EXP_DEVICE_ATTR_UMR;
@@ -52,4 +56,5 @@ void checkDMSupported(struct ibv_context *ctx) {
     kMaxDeviceMemorySize = attrs.max_dm_size;
     printf("NIC Device Memory is %dKB\n", kMaxDeviceMemorySize / 1024);
   }
+#endif
 }

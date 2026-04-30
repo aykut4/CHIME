@@ -79,8 +79,10 @@ bool createQueuePair(ibv_qp **qp, ibv_qp_type mode, ibv_cq *send_cq,
                      ibv_cq *recv_cq, RdmaContext *context,
                      uint32_t qpsMaxDepth = kQPMaxDepth, uint32_t maxInlineData = kInlineDataMax);
 
+#ifndef CXL_EMULATION
 bool createDCTarget(ibv_exp_dct **dct, ibv_cq *cq, RdmaContext *context,
                     uint32_t qpsMaxDepth = kQPMaxDepth, uint32_t maxInlineData = kInlineDataMax);
+#endif
 void fillAhAttr(ibv_ah_attr *attr, uint32_t remoteLid, uint8_t *remoteGid,
                 RdmaContext *context);
 

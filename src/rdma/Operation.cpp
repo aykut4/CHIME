@@ -90,6 +90,7 @@ static inline void fillSgeWr(ibv_sge &sg, ibv_recv_wr &wr, uint64_t source,
   wr.num_sge = 1;
 }
 
+#ifndef CXL_EMULATION
 static inline void fillSgeWr(ibv_sge &sg, ibv_exp_send_wr &wr, uint64_t source,
                              uint64_t size, uint32_t lkey) {
   memset(&sg, 0, sizeof(sg));
@@ -102,6 +103,7 @@ static inline void fillSgeWr(ibv_sge &sg, ibv_exp_send_wr &wr, uint64_t source,
   wr.sg_list = &sg;
   wr.num_sge = 1;
 }
+#endif
 
 // for UD and DC
 bool rdmaSend(ibv_qp *qp, uint64_t source, uint64_t size, uint32_t lkey,
