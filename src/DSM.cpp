@@ -51,6 +51,9 @@ DSM::DSM(const DSMConfig &conf)
   memset((char *)cache.data, 0, cache.size * define::GB);
 
   initRDMAConnection();
+#ifdef CXL_EMULATION
+  Debug::notifyInfo("Pure CXL emulation fast path enabled");
+#else
   if (myNodeID < MEMORY_NODE_NUM) {  // start memory server
     for (int i = 0; i < NR_DIRECTORY; ++i) {
       dirAgent[i] =
@@ -59,6 +62,7 @@ DSM::DSM(const DSMConfig &conf)
     Debug::notifyInfo("Memory server %d start up", myNodeID);
   }
   keeper->barrier("DSM-init");
+#endif
 }
 
 DSM::~DSM() { numa_free((void *)baseAddr, conf.dsmSize * define::GB); }
@@ -71,10 +75,29 @@ void DSM::registerThread() {
   thread_id = appID.fetch_add(1);
   thread_tag = thread_id + (((uint64_t)this->getMyNodeID()) << 32) + 1;
 
+#ifdef CXL_EMULATION
+  static thread_local ThreadConnection cxl_dummy_con{};
+  static thread_local bool cxl_inited = false;
+  if (!cxl_inited) {
+    for (int i = 0; i < NR_DIRECTORY; ++i) {
+      cxl_dummy_con.data[i] = new ibv_qp *[conf.machineNR];
+      for (uint32_t n = 0; n < conf.machineNR; ++n) {
+        cxl_dummy_con.data[i][n] = nullptr;
+      }
+    }
+    cxl_dummy_con.cacheLKey = 0;
+    cxl_dummy_con.cq = nullptr;
+    cxl_dummy_con.rpc_cq = nullptr;
+    cxl_dummy_con.message = nullptr;
+    cxl_inited = true;
+  }
+  iCon = &cxl_dummy_con;
+#else
   iCon = thCon[thread_id];
 
   iCon->message->initRecv();
   iCon->message->initSend();
+#endif
   rdma_buffer = (char *)cache.data + thread_id * define::kPerThreadRdmaBuf;
 
   for (int i = 0; i < MAX_CORO_NUM; ++i) {
@@ -120,6 +143,25 @@ void DSM::initRDMAConnection() {
   Debug::notifyInfo("Machine NR: %d", conf.machineNR);
 
   remoteInfo = new RemoteConnection[conf.machineNR];
+#ifdef CXL_EMULATION
+  myNodeID = 0;
+  for (int i = 0; i < conf.machineNR; ++i) {
+    remoteInfo[i].dsmBase = baseAddr;
+    remoteInfo[i].cacheBase = cache.data;
+    remoteInfo[i].lockBase = baseAddr;
+    for (int k = 0; k < NR_DIRECTORY; ++k) {
+      remoteInfo[i].dsmRKey[k] = 0;
+      remoteInfo[i].lockRKey[k] = 0;
+      remoteInfo[i].dirMessageQPN[k] = 0;
+    }
+    for (int k = 0; k < MAX_APP_THREAD; ++k) {
+      remoteInfo[i].appRKey[k] = 0;
+      remoteInfo[i].appMessageQPN[k] = 0;
+    }
+  }
+  keeper = nullptr;
+  return;
+#endif
 
   for (int i = 0; i < MAX_APP_THREAD; ++i) {
     thCon[i] =

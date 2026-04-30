@@ -149,8 +149,12 @@ public:
   int poll_rdma_cq_batch_once(uint64_t *wr_ids, int count);
 
   uint64_t sum(uint64_t value) {
+#ifdef CXL_EMULATION
+    return value;
+#else
     static uint64_t count = 0;
     return keeper->sum(std::string("sum-") + std::to_string(count++), value);
+#endif
   }
 
   // Memcached operations for sync
@@ -203,7 +207,13 @@ private:
 
 public:
   bool is_register() { return thread_id != -1; }
-  void barrier(const std::string &ss) { keeper->barrier(ss); }
+  void barrier(const std::string &ss) {
+#ifdef CXL_EMULATION
+    (void)ss;
+#else
+    keeper->barrier(ss);
+#endif
+  }
 
   char *get_rdma_buffer() { return rdma_buffer; }
   RdmaBuffer &get_rbuf(CoroPull* sink) { return rbuf[sink ? sink->get() : 0]; }
@@ -232,6 +242,13 @@ public:
 };
 
 inline GlobalAddress DSM::alloc(size_t size, uint8_t align_bit) {
+#ifdef CXL_EMULATION
+  (void)align_bit;
+  static std::atomic<uint64_t> cxl_alloc_off{0};
+  const uint64_t aligned = ((size + (1ull << CACHELINE_ALIGN_BIT) - 1) >> CACHELINE_ALIGN_BIT) << CACHELINE_ALIGN_BIT;
+  uint64_t off = cxl_alloc_off.fetch_add(aligned);
+  return GlobalAddress(0, off);
+#else
   thread_local int cur_target_node = (this->getMyThreadID() + this->getMyNodeID()) % MEMORY_NODE_NUM;
   thread_local int cur_target_dir_id = (this->getMyThreadID() + this->getMyNodeID()) % NR_DIRECTORY;
   if (++cur_target_dir_id == NR_DIRECTORY) {
@@ -255,10 +272,16 @@ inline GlobalAddress DSM::alloc(size_t size, uint8_t align_bit) {
     addr = local_allocator.malloc(size, need_chunk, align_bit);
   }
   return addr;
+#endif
 }
 
 inline void DSM::free(const GlobalAddress& addr, int size) {
+#ifdef CXL_EMULATION
+  (void)addr;
+  (void)size;
+#else
   local_allocators[addr.nodeID][0].free(addr, size);
+#endif
 }
 
 #endif /* __DSM_H__ */
