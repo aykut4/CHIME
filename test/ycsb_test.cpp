@@ -33,10 +33,10 @@
 #endif
 
 #define MAX_THREAD_REQUEST 10000000
-#define LOAD_HEARTBEAT 10000
+#define LOAD_HEARTBEAT 5000
 // #define USE_CORO
 #define EPOCH_LAT_TEST
-#define LOADER_NUM 8 // [CONFIG] 8
+#define LOADER_NUM 1 // [CONFIG] 1 for CXL emulation single-node to avoid lock contention during load
 
 extern double cache_miss[MAX_APP_THREAD];
 extern double cache_hit[MAX_APP_THREAD];
