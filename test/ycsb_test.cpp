@@ -198,9 +198,31 @@ void thread_load(int id) {
 
 
 void thread_run(int id) {
-  const int split = kThreadCount / 2;
-  const int target_node = (id < split) ? 0 : 1;
-  if (numa_run_on_node(target_node) != 0) {
+  // [CXL] NUMA placement is selectable via the CXL_PIN env var.
+  //   split  (default): half threads on node 0, half on node 1 (emulates a
+  //                     2-node DM cluster where memory lives on node 0).
+  //   local           : every thread on node 0 (memory and CPU co-located).
+  //   remote          : every thread on node 1 (every access crosses UPI =
+  //                     emulated CXL hop).
+  //   none            : no thread pinning (let the kernel scheduler decide).
+  static const char *pin_env = std::getenv("CXL_PIN");
+  const std::string mode = pin_env ? std::string(pin_env) : std::string("split");
+  int target_node = -1;
+  if (mode == "split") {
+    target_node = (id < kThreadCount / 2) ? 0 : 1;
+  } else if (mode == "local") {
+    target_node = 0;
+  } else if (mode == "remote") {
+    target_node = 1;
+  } else if (mode != "none") {
+    fprintf(stderr, "[CXL] unknown CXL_PIN=%s; falling back to split\n",
+            mode.c_str());
+    target_node = (id < kThreadCount / 2) ? 0 : 1;
+  }
+  if (id == 0) {
+    fprintf(stderr, "[CXL] thread placement mode = %s\n", mode.c_str());
+  }
+  if (target_node >= 0 && numa_run_on_node(target_node) != 0) {
     perror("numa_run_on_node");
     assert(false);
   }
