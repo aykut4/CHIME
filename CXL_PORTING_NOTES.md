@@ -44,6 +44,30 @@ lower 8 bits during the round-trip through `PackedGAddr`, so subsequent
 aligns both the bump cursor and the allocation size to `1 << align_bit`,
 making the round-trip identity for every node address.
 
+### 6) Throughput aggregation (`test/ycsb_test.cpp`)
+The original aggregator iterates over `kCoroCnt` coroutine slots when summing
+`tp[thread][slot]`. When the user runs without coroutines (`kCoroCnt = 0`)
+the loop runs zero times, so the engine reports `0 Mops` even though
+`tp[thread][0]++` is being incremented on every operation. The fix uses
+`max(1, kCoroCnt)` slots, so the no-coro path measures correctly.
+
+## Running the full YCSB suite
+
+A convenience runner ships under `scripts/run_ycsb_suite.sh`:
+
+```bash
+sudo bash scripts/run_ycsb_suite.sh -t 32                  # all of A,B,C,D,E
+sudo bash scripts/run_ycsb_suite.sh -t 32 -w "a c"         # subset
+sudo bash scripts/run_ycsb_suite.sh -t 32 -r my_label      # custom run tag
+```
+
+Each invocation produces `results/<run_tag>/`:
+
+- `cxl_<workload>_t<threads>.log`  — raw stdout/stderr from `ycsb_test`.
+- `cxl_<workload>_t<threads>.lat/` — per-epoch latency histograms.
+- `summary.csv` — one row per workload with throughput (Mops),
+  duration, total ops, p50/p95/p99/p999 latency in microseconds.
+
 ## Build Instructions
 
 ```bash

@@ -262,7 +262,8 @@ void thread_run(int id) {
     dsm->barrier("warm_finish");
 
     uint64_t ns = bench_timer.end();
-    printf("warmup time %lds\n", ns / 1000 / 1000 / 1000);
+    printf("warmup time %.3fs (%.0f ms)\n",
+           ns / 1e9, ns / 1e6);
 
     ready = true;
     warmup_cnt.store(-1);
@@ -395,8 +396,11 @@ int main(int argc, char *argv[]) {
                        (double)(e.tv_nsec - s.tv_nsec) / 1000;
 
     uint64_t all_tp = 0;
+    // [CXL] aggregate at least slot 0 even when running without coroutines
+    // (kCoroCnt=0); the no-coro path always writes tp[thread][0].
+    int tp_slots = std::max(1, kCoroCnt);
     for (int i = 0; i < MAX_APP_THREAD; ++i) {
-      for (int j = 0; j < kCoroCnt; ++j)
+      for (int j = 0; j < tp_slots; ++j)
         all_tp += tp[i][j];
     }
     clock_gettime(CLOCK_REALTIME, &s);
