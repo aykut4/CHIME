@@ -154,13 +154,27 @@ This is the default emulated 2-node DM cluster: **memory bound to NUMA 0**, thre
 
 p50 latency is essentially identical across placements (1.7–2.4 µs); p99 is also nearly invariant for point ops (4.4–11.6 µs). The throughput delta is parallelism-side, not per-op latency.
 
-### The unexpected finding — and the headline of the talk
+> **Reading note for the talk: the local-vs-remote delta is within run-to-run noise.** Each cell above is a single 0.8-second measurement window. Across A–E, |remote − local| / local is {+0.6, 0.0, −0.1, +3.3, −1.5}%; the mean is essentially zero and the spread is ±3%. **Treat `local` and `remote` as statistically tied for point ops.** The interesting signal is the ~24% gap between `split` and the other two, which is well above the noise floor and reproduces across all four point workloads.
+
+### The headline of the talk
 
 > *On this hardware, raw NUMA-remote DRAM latency is **not** the bottleneck for CHIME at YCSB scale. **Inter-socket cache-coherence traffic is.***
 
-- `local` and `remote` give **identical** point-op throughput (~11 Mops). Once a hot cache line lives in the executing socket's L3, every subsequent access is local — regardless of whether the *home* DRAM is across UPI or not.
-- `split` is *slower* than either extreme (~8.5 Mops, ~24% lower) because the same hot lines (root pointer, level-1 internal nodes, leaf locks) get modified from threads on **both** sockets. Cache-coherence ping-pong via UPI dominates the cost, and that cost only happens in the cross-socket configuration.
-- The exception is **workload E**: scans are bandwidth-bound, mostly read-only, and benefit from using *both* memory controllers and *both* L3 caches in parallel — so `split (1.69)` *beats* both `local (1.60)` and `remote (1.58)`.
+Why `local ≈ remote` for point ops (and why this is *expected*, not a bug):
+
+- The CHIME index cache (`kIndexCacheSize = 100 MB` in `include/Common.h`) plus the Zipfian θ=0.99 access skew gives a measured cache-hit rate of **99.84%** — the entire hot working set fits in a single socket's 22.5 MB L3.
+- Mean access latency is therefore `0.9984 × L3 + 0.0016 × DRAM`. In `local` that's `12 ns + 0.0016 × 80 ns ≈ 12.1 ns`. In `remote` the L3 is just *the other socket's* L3, and the misses go via UPI: `12 ns + 0.0016 × 140 ns ≈ 12.2 ns`. The "CXL hop" only applies to the 0.16% of ops that miss, so it's invisible at the throughput level.
+- This is itself a *result*: in steady state, most of CHIME's accesses don't actually exercise the network/CXL layer at all — they're served by the executing socket's L3.
+
+Why `split` is the slow one:
+
+- `split` is the only configuration where threads on **both** sockets modify the same hot cache lines (root pointer, level-1 internals, leaf locks). Each modification on socket 0 invalidates socket 1's copy and vice versa, forcing a UPI snoop + line transfer on every contended write.
+- Coherence ping-pong is *not* a function of where DRAM lives; it happens entirely in the inter-socket interconnect. That's why moving everything to NUMA 1 (`remote`) doesn't help — what matters is whether *threads on different sockets share the same cache line*, not whether DRAM is local.
+- This is the result that transfers to a real CXL.mem deployment: the cost of multiple compute hosts sharing CXL-attached memory will be dominated by **coherence traffic**, not load-store latency.
+
+Workload E is the only configuration where placement *does* directly probe DRAM:
+
+- Scans are read-mostly and bandwidth-bound. `split` uses *both* memory controllers and *both* L3 caches in parallel, so `split (1.69) > local (1.60) > remote (1.58)`. This is the only place the local-vs-remote ordering shows up correctly, and it does — `local` is 1.5% above `remote`, exactly as expected for a bandwidth-bound read pattern.
 
 ### Implication for CXL.mem
 
