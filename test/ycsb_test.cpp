@@ -33,7 +33,7 @@
 #endif
 
 #define MAX_THREAD_REQUEST 10000000
-#define LOAD_HEARTBEAT 100000
+#define LOAD_HEARTBEAT 10000
 // #define USE_CORO
 #define EPOCH_LAT_TEST
 #define LOADER_NUM 8 // [CONFIG] 8

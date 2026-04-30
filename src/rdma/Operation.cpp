@@ -1,6 +1,5 @@
 #include "Rdma.h"
 
-#include <atomic>
 #include<vector>
 
 int pollWithCQ(ibv_cq *cq, int pollNumber, struct ibv_wc *wc) {
@@ -283,8 +282,8 @@ bool rdmaFetchAndAdd(ibv_qp *qp, uint64_t source, uint64_t dest, uint64_t add,
   (void)qp;
   (void)lkey;
   (void)remoteRKey;
-  auto *dst = reinterpret_cast<std::atomic<uint64_t> *>(dest);
-  uint64_t old = dst->fetch_add(add, std::memory_order_seq_cst);
+  auto *dst = reinterpret_cast<uint64_t *>(dest);
+  uint64_t old = __atomic_fetch_add(dst, add, __ATOMIC_SEQ_CST);
   *reinterpret_cast<uint64_t *>(source) = old;
   return true;
 #else
@@ -359,9 +358,9 @@ bool rdmaCompareAndSwap(ibv_qp *qp, uint64_t source, uint64_t dest,
   (void)remoteRKey;
   (void)signal;
   (void)wrID;
-  auto *dst = reinterpret_cast<std::atomic<uint64_t> *>(dest);
+  auto *dst = reinterpret_cast<uint64_t *>(dest);
   uint64_t expected = compare;
-  dst->compare_exchange_strong(expected, swap, std::memory_order_seq_cst);
+  __atomic_compare_exchange_n(dst, &expected, swap, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
   *reinterpret_cast<uint64_t *>(source) = expected;
   return true;
 #else
@@ -401,16 +400,18 @@ bool rdmaCompareAndSwapMask(ibv_qp *qp, uint64_t source, uint64_t dest,
   (void)remoteRKey;
   (void)singal;
   (void)wrID;
-  auto *dst = reinterpret_cast<std::atomic<uint64_t> *>(dest);
-  uint64_t old = dst->load(std::memory_order_seq_cst);
+  auto *dst = reinterpret_cast<uint64_t *>(dest);
+  uint64_t old = __atomic_load_n(dst, __ATOMIC_SEQ_CST);
   while (true) {
     uint64_t new_val = (old & ~swap_mask) | (swap & swap_mask);
     if ((old & compare_mask) != (compare & compare_mask)) {
       break;
     }
-    if (dst->compare_exchange_weak(old, new_val, std::memory_order_seq_cst)) {
+    uint64_t expected = old;
+    if (__atomic_compare_exchange_n(dst, &expected, new_val, true, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
       break;
     }
+    old = expected;
   }
   *reinterpret_cast<uint64_t *>(source) = old;
   return true;
