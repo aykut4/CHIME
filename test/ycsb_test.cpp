@@ -364,7 +364,7 @@ int main(int argc, char *argv[]) {
   config.machineNR = kNodeCount;
   config.threadNR = kThreadCount;
   dsm = DSM::getInstance(config);
-  bindCore(kThreadCount * 2 + 1);
+  // bindCore(kThreadCount * 2 + 1);
 #ifdef ENABLE_CACHE_EVICTION
   dsm->loadKeySpace(ycsb_load_path, false);
 #else

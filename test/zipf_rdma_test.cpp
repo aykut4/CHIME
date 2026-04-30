@@ -361,7 +361,7 @@ std::atomic_bool ready{false};
 
 
 void thread_run(int id) {
-  bindCore(id * 2 + 1);  // bind to CPUs in NUMA that close to mlx5_2
+  // bindCore(id * 2 + 1);  // bind to CPUs in NUMA that close to mlx5_2
 
   dsm->registerThread();
   uint64_t my_id = kThreadCount * dsm->getMyNodeID() + id;

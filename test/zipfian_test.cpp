@@ -173,7 +173,7 @@ void thread_load(int id) {
 
 void thread_run(int id) {
 
-  bindCore(id * 2 + 1);
+  // bindCore(id * 2 + 1);
 
   dsm->registerThread();
 
