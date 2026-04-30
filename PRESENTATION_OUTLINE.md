@@ -122,33 +122,49 @@ This is what every DM data structure paper will have to answer eventually; we ru
 
 ---
 
-## 11. Results — single-host CXL emulation (your existing table)
+## 11. Results — baseline CXL emulation (split placement, 32 threads)
+
+This is the default emulated 2-node DM cluster: **memory bound to NUMA 0**, threads pinned 16/16 across sockets, every "remote" op crossing UPI.
+
 | Workload | Mix | Throughput (Mops) | p50 (µs) | p95 (µs) | p99 (µs) | p99.9 (µs) |
 |---|---|---:|---:|---:|---:|---:|
-| A | 50/50 R/U | **8.31** | 1.90 | 3.40 | 4.90 | 46.20 |
-| B | 95/5 R/U | **8.67** | 1.90 | 3.90 | 6.10 | 45.70 |
-| C | 100% R | **8.42** | 1.90 | 7.90 | 11.50 | 43.10 |
-| D | 95/5 R/Insert(latest) | **8.56** | 1.90 | 3.20 | 4.40 | 48.60 |
-| E | 95/5 Scan/Insert | **1.81** | 3.50 | 85.40 | 131.10 | 172.50 |
+| A | 50/50 R/U | **8.69** | 2.00 | 3.60 | 5.10 | 45.00 |
+| B | 95/5 R/U | **8.34** | 2.00 | 4.00 | 5.90 | 42.00 |
+| C | 100% R | **8.26** | 1.90 | 7.80 | 11.60 | 40.20 |
+| D | 95/5 R/Insert(latest) | **9.11** | 1.70 | 3.20 | 4.80 | 44.60 |
+| E | 95/5 Scan/Insert | **1.69** | 3.70 | 90.40 | 116.00 | 150.80 |
 
 **Talking points for this slide:**
-- Point ops (A/B/C/D) all sit ~8.3 Mops because each is single round-trip-ish in CXL ≈ ~120 ns hot, 4 µs throughput-per-op at saturation.
-- Workload C (read-only) has the worst p99 of the point ops — unintuitive, but it's because reads exercise speculative-read + index-cache paths the most aggressively, so cache misses hurt.
-- Workload E collapses to ~22% of the point-op throughput because each scan visits multiple leaves (range query). p99 jumps an order of magnitude.
+- Point ops (A/B/C/D) all sit ~8.3–9.1 Mops because each is essentially one cache-line-sized load + one CAS in CXL — ~120 ns hot, ~4 µs throughput-per-op at saturation.
+- Workload C (read-only) has the worst point-op p99 (11.6 µs) — counter-intuitive, but reads exercise the speculative-read + index-cache paths the most aggressively, so the misses are concentrated.
+- Workload E collapses to ~20% of point-op throughput: each scan visits multiple leaves and is bandwidth-bound, not latency-bound.
+- Per-thread efficiency: 8.7 Mops / 32 threads ≈ **0.27 Mops/thr**, vs ~0.12 Mops/thr in the original CHIME paper running over RDMA on 8 MNs / 256 threads.
 
 ---
 
-## 12. Results — NUMA placement ablation *(needs the new run)*
-*Bar chart: x=workload, y=Mops, three bars per group: local / split / remote.*
+## 12. Results — NUMA placement ablation (the central slide)
 
-Expected story (fill in with real numbers from `scripts/run_numa_placement.sh`):
-- **`local`** (every thread on NUMA 0) ≈ upper bound. No UPI hops.
-- **`remote`** (every thread on NUMA 1) ≈ lower bound. Every memory op crosses UPI.
-- **`split`** ≈ what a 2-node DM cluster would feel, halfway between the two.
+*Bar chart: x = workload, y = Mops, three bars per group:* `local` / `split` / `remote`. Memory always pinned to NUMA 0; only thread placement changes.
 
-Quantify: `(local - remote) / local` is the **CXL-hop tax** in your emulation. That number is the headline of this slide.
+| placement | how to read it | A | B | C | D | E |
+|---|---|---:|---:|---:|---:|---:|
+| `local`  (32 threads on NUMA 0) | "all data is local" upper bound | **11.01** | **11.70** | **10.86** | **11.32** | 1.60 |
+| `split`  (16 + 16 across sockets) | emulated 2-node DM cluster | 8.69 | 8.34 | 8.26 | 9.11 | **1.69** |
+| `remote` (32 threads on NUMA 1) | "every op crosses UPI" upper bound | 11.08 | 11.70 | 10.85 | 11.70 | 1.58 |
 
-Optional second chart: `numastat -m` snapshot showing NUMA 1 → NUMA 0 traffic increases monotonically from `local → split → remote`.
+p50 latency is essentially identical across placements (1.7–2.4 µs); p99 is also nearly invariant for point ops (4.4–11.6 µs). The throughput delta is parallelism-side, not per-op latency.
+
+### The unexpected finding — and the headline of the talk
+
+> *On this hardware, raw NUMA-remote DRAM latency is **not** the bottleneck for CHIME at YCSB scale. **Inter-socket cache-coherence traffic is.***
+
+- `local` and `remote` give **identical** point-op throughput (~11 Mops). Once a hot cache line lives in the executing socket's L3, every subsequent access is local — regardless of whether the *home* DRAM is across UPI or not.
+- `split` is *slower* than either extreme (~8.5 Mops, ~24% lower) because the same hot lines (root pointer, level-1 internal nodes, leaf locks) get modified from threads on **both** sockets. Cache-coherence ping-pong via UPI dominates the cost, and that cost only happens in the cross-socket configuration.
+- The exception is **workload E**: scans are bandwidth-bound, mostly read-only, and benefit from using *both* memory controllers and *both* L3 caches in parallel — so `split (1.69)` *beats* both `local (1.60)` and `remote (1.58)`.
+
+### Implication for CXL.mem
+
+CXL.mem is going to look much more like the cross-socket case than the all-local one because compute hosts share the same CXL-attached memory and modify it concurrently. **The dominant cost will not be the device's load-store latency — it will be the cache-coherence protocol** that keeps multiple compute hosts' caches in sync over CXL.cache / CXL.io. CHIME's contributions (hopscotch, VALOCK, metadata replication) shrink the *number of remote ops*, but they do not reduce the *coherence traffic* introduced by sharing — that's what a CXL-aware redesign would have to attack.
 
 ---
 
@@ -164,25 +180,29 @@ Expected: linear scaling up to 16 (one socket worth of physical cores), super-li
 ## 14. Results — comparison to the CHIME paper
 *Apples-to-oranges, but informative.*
 
-| Setting | Hardware | Threads | YCSB-A Mops |
-|---|---|---:|---:|
-| CHIME paper (RDMA, 8 MNs) | 8× MN + 8× CN, 200 GbE RDMA | 256 client threads | 31.5 |
-| **This project (CXL-emulated, 1 host)** | 1× dual-socket Xeon Gold 6142 | 32 threads | **8.3** |
-| **per-thread** | — | — | RDMA: 0.12 Mops/thr · CXL-emu: **0.26 Mops/thr** |
+| Setting | Hardware | Threads | YCSB-A Mops | per-thread |
+|---|---|---:|---:|---:|
+| CHIME paper (RDMA, 8 MNs) | 8× MN + 8× CN, 200 GbE RDMA | 256 client threads | 31.5 | 0.123 Mops/thr |
+| **CXL-emulated `split` (this project)** | 1× dual-socket Xeon Gold 6142 | 32 threads | **8.69** | **0.272 Mops/thr** |
+| **CXL-emulated `local` upper bound** | 1× socket NUMA 0 only | 32 threads (HT) | **11.01** | **0.344 Mops/thr** |
 
-Talking point: per-thread, CXL-emulation is ~2× more efficient. With more sockets / threads we'd expect the absolute number to scale near-linearly because each "memory op" is now a DRAM access, not a network round-trip — i.e. throughput is capped by cache-line bandwidth, not HCA queue depth.
-
-This is precisely the prediction CXL-DM enthusiasts make. Your project is one of the first concrete empirical points on the "what does CHIME look like under CXL" line.
+**Talking points:**
+- Per-thread, the CXL-emulated 2-node cluster is ~**2.2×** more efficient than the published 8-node RDMA cluster. The "ideal CXL" upper bound (no cross-socket traffic) is **2.8×**.
+- This factor is consistent with replacing a ~2 µs RDMA RTT with a few-hundred-ns CXL/UPI hop *when caches are hot*.
+- It is *not* a 20× speedup, because at this scale the workload was never network-bound to begin with — it was *contention*-bound, and contention exists in both fabrics.
+- This makes CHIME a strong concrete data point on the line "what does CHIME look like under CXL" — and shows that the headline number we should track post-port is *coherence traffic*, not raw RTT.
 
 ---
 
 ## 15. Discussion — what changes about CHIME under CXL?
-*One slide of takeaways:*
-1. **The four CHIME tricks pay off less.** Hopscotch / VALOCK / metadata replication / speculative read are amortizations of network latency. With UPI/CXL latency being 20–100× lower, they shrink to micro-optimizations rather than first-order wins.
-2. **The bottleneck shifts from network to lock contention.** With per-op latency below 200 ns, even short critical sections matter; the lock-CAS retry rate becomes the relevant metric.
-3. **Coroutines stop helping.** `kCoroCnt=8` exists to hide RDMA latency. With CXL there's not enough latency to hide; the no-coro path is competitive.
-4. **The index cache becomes more about *capacity* than *latency*.** With cheap remote access, you stop caching to avoid round-trips and start caching only what fits in L3 (since DRAM ≈ remote-DRAM).
-5. **Allocator/alignment invariants become subtle.** CXL-class "memory" is still indexed by full host VA, but DM systems often pack pointers — your bump allocator must keep every alignment promise the original made.
+*One slide of takeaways, now backed by the placement experiment:*
+
+1. **The four CHIME tricks pay off less.** Hopscotch leaves / VALOCK / metadata replication / speculative read all *amortize a network round-trip*. With UPI/CXL one-hop latency 20–100× lower than RDMA RTT, they shrink to micro-optimizations rather than first-order wins.
+2. **The bottleneck shifts from network latency → cache-coherence traffic.** Our placement ablation (slide 12) shows `local ≈ remote ≪ split` — the ~24% throughput loss in the split (i.e. realistic) topology is *coherence ping-pong on hot lines*, not raw remote-DRAM latency. CXL-aware DM trees will need to attack *write-side sharing*, e.g. with delegation, sharded locks, or per-host hot copies.
+3. **Coroutines stop helping.** `kCoroCnt=8` exists to hide RDMA latency. With CXL there's not enough latency to hide, and the no-coro path is competitive — our entire run uses `kCoroCnt=0`.
+4. **The index cache becomes more about *capacity* than *latency*.** With cheap remote access, you stop caching to avoid round-trips and start caching only what fits in L3 (since remote-DRAM ≈ local-DRAM). The cache-hit rate (99.84%) was high simply because the entire 60 K-key working set fit in L3.
+5. **Allocator/alignment invariants become subtle.** CXL-class "memory" is still indexed by full host VA, but DM systems pack pointers (e.g. CHIME's `PackedGAddr`). A re-targeted allocator must keep every alignment promise the original made — we hit this exact bug and it cost us a day.
+6. **Bandwidth wins, sometimes.** Workload E (scans) is the only configuration where `split` beats `local` and `remote` (slide 12). Once you're bandwidth-bound, using *more* memory controllers helps, even if it costs coherence — a useful design dial for read-heavy scan workloads.
 
 ---
 
