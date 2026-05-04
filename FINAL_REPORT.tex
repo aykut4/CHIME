@@ -1,0 +1,223 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  showstringspaces=false,
+}
+
+\title{CS 6204 -- Final Project Report \\ Reproducing CHIME on RDMA and Porting It to an Emulated CXL Substrate}
+\author{Aykut Sahin}
+\date{May 4, 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent We study \textsc{Chime}~(SOSP'24), a hybrid B+ tree designed for disaggregated memory (DM) over RDMA, in two stages. \textbf{Part~1} reproduces the original system on a 3-node RDMA cluster on CloudLab and confirms its central performance claim: 12.98~Mops on YCSB Workload~A with a 100\% inner-node cache hit rate. \textbf{Part~2} ports the same codebase to an emulated CXL substrate---a single dual-socket server in which the inter-socket UPI bus stands in for the CXL hop---and runs the full YCSB A--E suite together with a NUMA-placement ablation. The CXL port reaches \textbf{0.27~Mops/thread} on YCSB-A versus 0.18~Mops/thread on our RDMA cluster (a 1.5$\times$ per-thread improvement) and 0.12~Mops/thread reported in the original paper (2.2$\times$). Crucially, the placement experiment shows that the dominant performance lever in the CXL setting is \emph{not} raw cross-socket DRAM latency---which is invisible at \textsc{Chime}'s 99.84\% L3 hit rate---but \emph{inter-socket cache-coherence traffic} on the small set of hot tree lines. We argue this finding generalizes to real CXL.mem deployments and reframes which of \textsc{Chime}'s contributions still pay off when the network is replaced by a coherent fabric.
+\end{abstract}
+
+\section{Introduction}
+Disaggregated memory (DM) decouples compute from memory, exposing pooled DRAM to multiple hosts over a fabric (RDMA today; CXL.mem in the near future). The dominant cost in DM is no longer the CPU--DRAM gap but the \emph{remote-fetch tax}: every leaf-level access in a tree index becomes a network round-trip. \textsc{Chime} attacks this with a hybrid B+ tree whose leaves are hopscotch-hashed to bound the size of each remote fetch, plus a family of co-designed mechanisms (vacancy-aware locks, replicated metadata, sibling-based validation) to keep round-trip counts low. \textsc{Chime} is the current state-of-the-art DM index, beating Sherman, FORD/DeFT, and learned-index proposals like ROLEX.
+
+This project reports on two efforts. Section~\ref{sec:reproduction} reproduces \textsc{Chime}'s headline result on a real RDMA cluster (CloudLab \texttt{r650} nodes, RoCEv2). Section~\ref{sec:cxlport} ports the same codebase to an emulated CXL substrate (single dual-socket \texttt{c6420} server, UPI as the CXL stand-in) and studies how the system behaves when the network round-trip---the very thing the four \textsc{Chime} ideas were designed to amortize---collapses into a cache-coherent load. The purpose of Part~2 is not to claim a new system; it is to use a real, mature DM index as a probe and ask: \emph{which of the original ideas still matter under CXL, and what becomes the new bottleneck?}
+
+\section{Algorithmic Background: What \textsc{Chime} Does}
+\label{sec:alg}
+A \textsc{Chime} read or write traverses a B+ tree whose leaves live in remote (DM) memory. The four contributions all attack one of two costs: the number of remote bytes per operation, or the number of round-trips per operation.
+\begin{enumerate}
+    \item \textbf{Hopscotch leaf nodes.} A leaf is an open-addressed hash table with a bounded probe window $H$. On insert, displaced entries are hopped toward their home bucket so the key always lands within $H$ slots. \emph{Why DM cares:} a point read needs to fetch at most $H$ cache lines (1--2 RDMA reads), independent of leaf occupancy. Sherman, by contrast, must fetch the entire sorted leaf to binary-search.
+    \item \textbf{Vacancy-Aware Lock (\textsc{Valock}).} The 8-byte lock word piggybacks the leaf's vacancy bitmap and the index of the max-key slot. A reader observing the lock already knows which slots are populated and where the data ends, so it can issue a gather-style read of \emph{only} the live cache lines. No prior DM index couples concurrency control with content metadata in this way.
+    \item \textbf{Metadata replication.} The leaf's tiny critical metadata (version, fence keys, fingerprints) is replicated across every cache line, not concentrated in a header. This makes one-sided RDMA reads torn-tolerant at cache-line granularity and enables lock-free reads even though writers hold a lock.
+    \item \textbf{Sibling-based validation + speculative read.} Each leaf carries its right-sibling pointer and the split key (a B$^{\text{link}}$-tree fence-key invariant). After the index cache predicts a leaf, the reader speculatively goes there and validates via the fence keys; if the prediction was wrong, it follows the sibling pointer rather than re-reading the parent. This eliminates one full level of internal-node traversal per query.
+\end{enumerate}
+The unifying theme is: \emph{in DM, performance is dominated by remote bytes per op and round-trips per op; every \textsc{Chime} idea attacks one of those two}. We will return to this taxonomy in Section~\ref{sec:discussion} when we evaluate which of the four still pay off under CXL.
+
+\section{Part 1: Reproduction on a Real RDMA Cluster}
+\label{sec:reproduction}
+
+\subsection{Hardware and Network Topology}
+We provisioned a 3-node cluster of CloudLab \texttt{r650} instances. Each node has Mellanox ConnectX NICs running RoCEv2 (RDMA over Converged Ethernet), so one-sided RDMA verbs bypass the host CPU on remote accesses. The 3-node topology is:
+\begin{itemize}
+    \item \textbf{Node 0 (Coordinator/Memory Node):} primary memory node, allocates 64~GB of DSM-shared memory, also acts as a compute node.
+    \item \textbf{Nodes 1 and 2 (Compute Nodes):} pure compute clients issuing one-sided RDMA verbs to Node~0.
+\end{itemize}
+
+\subsection{Workload and Configuration}
+We ran YCSB Workload~A (50\%~read, 50\%~update) over a uniform-random integer key space (\texttt{randint}). Concurrency is 24 client threads per node (72 threads cluster-wide), each with 2 coroutines to hide RDMA round-trip latency. Each compute node maintains a 4~GB RDMA-registered cache for inner B+ tree nodes.
+
+\subsection{Execution Steps}
+Reproducing the system required several low-level configurations across all nodes:
+\begin{enumerate}
+    \item \textbf{Driver initialization:} installed Mellanox OFED, re-partitioned the root filesystems for sufficient headroom.
+    \item \textbf{Memory management:} allocated 36{,}864 huge pages (\texttt{/proc/sys/vm/nr\_hugepages}) per node, a hard requirement for DMA-pinned RDMA buffers.
+    \item \textbf{Data generation:} downloaded YCSB 0.11.0 and generated the local \texttt{load\_randint\_workloada} dataset.
+    \item \textbf{Execution:} brought up \texttt{memcached} on Node~0 for the initial RDMA QP key exchange, sharded the dataset across the three nodes, and ran the C++ benchmark binary synchronously across the cluster for 10 epochs.
+\end{enumerate}
+
+\subsection{Results}
+Epoch~1 served as the cache warm-up phase and produced essentially zero throughput (initial remote fetches; P99 latency of 100.2~$\mu$s). From Epoch~2 onwards the compute caches were warm and the inner-node cache hit rate stabilized at 100\%. Steady-state cluster numbers are in Table~\ref{tab:p1_results}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Metric} & \textbf{Average (Epochs 2--10)} & \textbf{Peak (Epoch~2)} \\ \midrule
+Cluster throughput & 12.98~Mops & 13.227~Mops \\
+Median latency (P50) & 9.1~$\mu$s & 8.2~$\mu$s \\
+Tail latency (P99) & 52.1~$\mu$s & 40.8~$\mu$s \\ \bottomrule
+\end{tabular}
+\caption{RDMA cluster, YCSB Workload~A (50\%~Read / 50\%~Update), 3 nodes, 72 client threads, 2 coroutines per thread.}
+\label{tab:p1_results}
+\end{table}
+
+These numbers reproduce the original paper's claims qualitatively. A cluster-wide 13~Mops with a 52~$\mu$s P99 over a physical RoCEv2 fabric confirms that the hopscotch leaves keep RDMA reads to a small constant number of cache lines, and that the speculative-read path keeps internal-node traversals out of the hot path once the inner cache is warm.
+
+\section{Part 2: Porting CHIME to an Emulated CXL Substrate}
+\label{sec:cxlport}
+
+\subsection{Why a CXL Port?}
+\textsc{Chime} (and its DM peers) were all designed against a \emph{network} as the remote-access primitive: the operation budget is single-digit RDMA round-trips and a few microseconds. CXL.mem changes the model fundamentally: remote memory becomes a \emph{cache-coherent load/store}, with one-hop latency in the 100--300~ns range rather than the 1--3~$\mu$s range. This raises a research-relevant question: which of \textsc{Chime}'s four mechanisms still pay off when the underlying access primitive is 10--20$\times$ faster, and what becomes the new bottleneck? We answer this empirically by running the same code on a substrate that has CXL's latency class but no CXL hardware.
+
+\subsection{Emulation Methodology}
+We use a single dual-socket CloudLab \texttt{c6420} machine and emulate a 2-node DM cluster with two NUMA nodes. NUMA~0 plays the role of the ``memory node'' (all DSM allocations live there); NUMA~1 plays a ``remote compute node'' (every memory access from threads on node~1 crosses the UPI bus). The host:
+\begin{lstlisting}
+2 x Intel Xeon Gold 6142 @ 2.6 GHz, 16 cores/socket, HT on (64 logical)
+192 GB DDR4 per socket (384 GB total)
+L1d 32 KB, L2 1024 KB, L3 22.5 MB shared per socket
+NUMA distances: local=10, remote=21 (numactl --hardware)
+Ubuntu 18.04.1, kernel 4.15
+\end{lstlisting}
+UPI is not CXL.mem, but its latency class (\(\sim\)80~ns local DRAM, \(\sim\)140~ns remote-via-UPI, plus cache-coherent semantics) is the right approximation for the load--store, coherent-fabric model that CXL.mem exposes. We do not emulate CXL.mem's bandwidth ceiling or device-side buffering; this study is about access asymmetry and coherence behaviour.
+
+\subsection{Porting Effort}
+\textsc{Chime}'s entire data plane is structured around RDMA verbs (\texttt{ibv\_post\_send} with \texttt{IBV\_WR\_RDMA\_READ/WRITE/ATOMIC}, \texttt{ibv\_reg\_mr} for memory-region pinning, \texttt{ibv\_poll\_cq} for completion). We added a compile-time switch \texttt{-DCXL\_EMULATION=ON} that replaces these primitives with their cache-coherent equivalents while leaving the algorithm itself untouched. The non-trivial edits are summarized in Table~\ref{tab:port_changes}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{0.42\textwidth}p{0.18\textwidth}p{0.34\textwidth}@{}}
+\toprule
+\textbf{Change} & \textbf{File} & \textbf{Rationale} \\ \midrule
+Add \texttt{CXL\_EMULATION} build option & \texttt{CMakeLists.txt} & Compile-time switch for the new data path \\
+Replace one-sided \texttt{rdmaRead/Write} with \texttt{memcpy} & \texttt{src/rdma/Operation.cpp} & One-sided ops collapse to load/store \\
+Replace RDMA CAS / FAA with GCC \texttt{\_\_atomic\_*} builtins & \texttt{src/rdma/Operation.cpp} & UPI is cache-coherent, GCC atomics are correct and cheap \\
+Stub \texttt{pollWithCQ}, \texttt{pollOnce} & \texttt{src/rdma/Operation.cpp} & No HCA, no completion queue \\
+Fence-off \texttt{ibv\_exp\_*} symbols & \texttt{src/rdma/\{Resource,StateTrans,Utility\}.cpp} & Modern \texttt{rdma-core} drops the experimental Mellanox ABI \\
+\texttt{numa\_alloc\_onnode(size,~0)} for DSM base & \texttt{src/DSM.cpp} & Force memory residency on node~0 \\
+Bypass DSM-keeper / memcached rendezvous & \texttt{src/DSM.cpp}, \texttt{include/DSM.h} & No control plane in single-host emulation \\
+\textbf{Honor \texttt{align\_bit} in CXL bump allocator} & \texttt{include/DSM.h} & Critical correctness fix; see \S\ref{sec:packed_bug} \\
+\texttt{CXL\_PIN} env-var thread placement (\texttt{numa\_run\_on\_node}) & \texttt{test/ycsb\_test.cpp} & Selectable local/split/remote topology \\
+\bottomrule
+\end{tabular}
+\caption{Structural edits required to compile and run \textsc{Chime} without an HCA on top of a coherent NUMA fabric.}
+\label{tab:port_changes}
+\end{table}
+
+\subsection{The Hardest Bug: \texttt{PackedGAddr} Alignment}
+\label{sec:packed_bug}
+\textsc{Chime} stores root pointers and child pointers in a packed 5-byte format (\texttt{PackedGAddr}) that drops the lower \texttt{PACKED\_ADDR\_ALIGN\_BIT}~=~8 bits of the offset, exploiting the invariant that all node allocations are at least 256-byte aligned. Our initial CXL bump allocator only enforced 64-byte (cache-line) alignment, which is the natural granularity of \texttt{numa\_alloc\_onnode}. After the first root split, the new internal-root node was 64-byte aligned but \emph{not} 256-byte aligned; packing it into \texttt{RootEntry} silently zeroed the bottom 8 bits of its offset. Subsequent reads of the corrupted root pointer landed in the middle of an unrelated leaf, \texttt{decode\_node\_versions} consistently failed, and the read path looped indefinitely on its \texttt{re\_read} retry. Symptom: \texttt{ycsb\_test} loaded the dataset successfully and then hung silently.
+
+The fix was to make the CXL allocator honour the \texttt{align\_bit} parameter passed by the caller (the same parameter the original RDMA allocator already obeyed). This is a clean illustration of a class of bugs that surface specifically when re-targeting DM systems to a new substrate: \emph{packed-pointer formats encode invariants about the underlying allocator that are not part of the public interface}, and any new allocator must reconstruct those invariants from the data structures, not from the API.
+
+\subsection{Experimental Setup}
+For all Part~2 experiments: 32 application threads, no coroutines (\texttt{kCoroCnt}~=~0; coroutines exist to hide RDMA latency, which is gone here), \texttt{randint} keys, 60{,}000 records loaded, 5 epochs of 200~ms each (\texttt{SHORT\_TEST\_EPOCH=ON}), first epoch dropped as warmup. Memory always pinned to NUMA~0 via \texttt{numactl --membind=0} and \texttt{numa\_alloc\_onnode}. Three thread placements selectable at runtime via the \texttt{CXL\_PIN} environment variable: \texttt{local} (all 32 threads on NUMA~0), \texttt{remote} (all 32 threads on NUMA~1, every memory op crosses UPI), \texttt{split} (16 threads per socket; this is the realistic ``emulated 2-node DM cluster'' topology).
+
+\subsection{Baseline Results: YCSB A--E in the Split Topology}
+Table~\ref{tab:p2_baseline} reports the realistic 16/16 split topology. Point operations sit at 8.3--9.1~Mops, scans at 1.7~Mops. P50 latency is 1.7--2.0~$\mu$s for point ops and 3.7~$\mu$s for scans. With 32 threads on a single host this is \textbf{0.27~Mops/thread}---about 1.5$\times$ better than our 3-node RDMA cluster (0.18~Mops/thread, Part~1) and 2.2$\times$ better than the 8-node configuration in the original paper (0.12~Mops/thread).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llrrrrr@{}}
+\toprule
+\textbf{Workload} & \textbf{Mix} & \textbf{Mops} & \textbf{P50 ($\mu$s)} & \textbf{P95 ($\mu$s)} & \textbf{P99 ($\mu$s)} & \textbf{P99.9 ($\mu$s)} \\ \midrule
+A & 50/50 R/U & 8.69 & 2.0 & 3.6 & 5.1 & 45.0 \\
+B & 95/5 R/U & 8.34 & 2.0 & 4.0 & 5.9 & 42.0 \\
+C & 100\% Read & 8.26 & 1.9 & 7.8 & 11.6 & 40.2 \\
+D & 95/5 R/Insert(latest) & 9.11 & 1.7 & 3.2 & 4.8 & 44.6 \\
+E & 95/5 Scan/Insert & 1.69 & 3.7 & 90.4 & 116.0 & 150.8 \\ \bottomrule
+\end{tabular}
+\caption{Baseline CXL-emulated \textsc{Chime}, split placement (16 threads on NUMA~0, 16 on NUMA~1), memory bound to NUMA~0. 32 threads, 0 coroutines, 60{,}000 records, Zipfian $\theta$=0.99.}
+\label{tab:p2_baseline}
+\end{table}
+
+\subsection{NUMA Placement Ablation}
+\label{sec:placement}
+The placement ablation is the central experiment of Part~2. We rerun YCSB A--E in three thread placements while keeping memory pinned to NUMA~0. The throughput numbers are in Table~\ref{tab:p2_placement}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{Placement} & \textbf{A (Mops)} & \textbf{B} & \textbf{C} & \textbf{D} & \textbf{E (scan)} \\ \midrule
+\texttt{local}  (32 threads on NUMA~0)  & \textbf{11.01} & \textbf{11.70} & \textbf{10.86} & \textbf{11.32} & 1.60 \\
+\texttt{split}  (16 + 16 across sockets) & 8.69  & 8.34  & 8.26  & 9.11  & \textbf{1.69} \\
+\texttt{remote} (32 threads on NUMA~1)  & 11.08 & 11.70 & 10.85 & 11.70 & 1.58 \\ \bottomrule
+\end{tabular}
+\caption{Throughput vs.\ thread placement on the emulated 2-socket CXL substrate. Memory is always on NUMA~0; only thread placement changes. P50 latency is essentially placement-invariant (1.7--2.4~$\mu$s) and is omitted for space.}
+\label{tab:p2_placement}
+\end{table}
+
+Two findings stand out, both reproducible across A--D.
+
+\textbf{Finding 1: \texttt{local} and \texttt{remote} are statistically indistinguishable on point operations.} The naive expectation is \texttt{local}~$>$~\texttt{remote} by the ratio of NUMA-local to NUMA-remote DRAM latency ($\sim$80~ns vs.\ $\sim$140~ns). What we observe instead is essentially equality: across A--E the per-workload spread of \texttt{remote}/\texttt{local} is $\{+0.6, 0.0, -0.1, +3.3, -1.5\}\%$, with a mean near zero. This is not a measurement artefact---workload~E does show the expected ordering (\texttt{local}~$>$~\texttt{remote} by 1.5\%), confirming that thread pinning is being applied. The reason point operations show no ordering is the \textbf{99.84\% inner-cache hit rate} we measured: the entire 60K-record working set fits in either socket's 22.5~MB L3, so almost no memory access reaches DRAM. The mean access latency is approximately
+\[
+0.9984 \cdot \tau_{L3} + 0.0016 \cdot \tau_{\text{DRAM}}
+\]
+which is dominated by the L3 term and identical in both placements (both have a hot socket-local L3). The CXL hop tax only applies to the 0.16\% of ops that miss to DRAM, and that contribution is below our throughput noise floor.
+
+\textbf{Finding 2: \texttt{split} is the slowest placement, by a substantial 24\%}, on every point workload. This is counter-intuitive at first glance---\texttt{split} has half its threads accessing memory locally---but it is the only placement in which threads on \emph{different} sockets concurrently modify the same hot cache lines (the root pointer, level-1 internal nodes, leaf locks). Every cross-socket modification forces an inter-socket cache-coherence transfer over UPI: invalidate the line in the other socket's L3, transfer ownership, complete the write. This coherence ping-pong is independent of where DRAM lives, which is why moving everything to NUMA~1 (\texttt{remote}) does not reproduce it---in \texttt{remote} all 32 threads share NUMA~1's L3 and there is no cross-socket sharing.
+
+\textbf{Workload E is the exception that proves the rule.} Scans are bandwidth-bound and read-mostly: the cost is in pulling many leaf cache lines, not in modifying contended ones. \texttt{split} wins on E (1.69 vs.\ 1.60 / 1.58~Mops) because using both sockets' memory controllers and both L3s in parallel doubles available read bandwidth, and there is little coherence cost to offset that win.
+
+\subsection{Comparison to Part~1 and to the Original Paper}
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lllrr@{}}
+\toprule
+\textbf{Setting} & \textbf{Substrate} & \textbf{Threads} & \textbf{YCSB-A Mops} & \textbf{Mops/thread} \\ \midrule
+\textsc{Chime} paper (8 MNs)            & RDMA RoCEv2 & 256 & 31.5 & 0.123 \\
+\textbf{Part~1 (this work)}, 3 \texttt{r650} nodes & RDMA RoCEv2 & 72  & 12.98 & 0.180 \\
+\textbf{Part~2 split}, 1 \texttt{c6420}   & CXL (UPI emu) & 32  & 8.69  & 0.272 \\
+\textbf{Part~2 local} (upper bound), 1 \texttt{c6420} & CXL (UPI emu) & 32 & 11.01 & 0.344 \\ \bottomrule
+\end{tabular}
+\caption{Per-thread throughput across the three reference points. Part~2 \texttt{split} is the realistic 2-node-emulation result; \texttt{local} is an upper bound with no cross-socket sharing.}
+\label{tab:cross_compare}
+\end{table}
+
+The trend in Table~\ref{tab:cross_compare} is consistent: per-thread efficiency rises monotonically as the remote-access primitive shortens, from $\sim$2~$\mu$s RDMA RTT to a few-hundred-nanosecond UPI hop. The 2.2$\times$ jump from the paper's RDMA cluster to our \texttt{split} topology is broadly the speedup one would predict from the latency ratio, multiplied by the 99.84\% L3 hit rate that makes most accesses local-L3 anyway. This is not a 20$\times$ speedup, because at this scale the workload was never network-bound to begin with---it was contention-bound, and contention exists in both fabrics.
+
+\section{Discussion: What Changes About \textsc{Chime} Under CXL?}
+\label{sec:discussion}
+We can now revisit the four \textsc{Chime} contributions of Section~\ref{sec:alg} through the lens of the placement experiment.
+
+\begin{enumerate}
+    \item \textbf{Hopscotch leaves: still load-bearing.} Bounded leaf size keeps the working set in L3, which Section~\ref{sec:placement} shows is the dominant performance lever. The mechanism's \emph{purpose} shifts from ``minimize bytes per RDMA fetch'' to ``minimize the working-set footprint that has to fit in L3,'' but the implementation is the same.
+    \item \textbf{\textsc{Valock}: still load-bearing, for a different reason.} Fetching only the populated cache lines reduces the number of distinct lines a leaf operation touches, which under cross-socket sharing translates directly to less coherence ping-pong. \textsc{Valock}'s value transfers cleanly from ``RDMA byte minimization'' to ``coherence-traffic minimization.''
+    \item \textbf{Metadata replication: redundant under CXL.} CXL.mem (and the UPI emulation we use) provides cache-line-granularity atomic visibility natively. Replicating metadata across cache lines to detect torn one-sided RDMA reads buys nothing when there are no torn one-sided reads in the first place. The replication overhead is dead weight that should be removed in a CXL-native rewrite.
+    \item \textbf{Sibling-based validation + speculative read: still load-bearing.} Skipping a level of internal-node fetches is now valuable not because it saves a round-trip (cheap under CXL) but because it reduces the number of contended hot lines whose ownership has to ping-pong between sockets.
+\end{enumerate}
+
+The headline of Part~2: \emph{two of \textsc{Chime}'s four contributions were latency-amortizers and lose value under CXL; two were sharing-reducers and pay off as much or more.} The new bottleneck for a CXL-native DM tree is cross-host cache coherence on the small set of hot tree lines---root pointer, level-1 internals, leaf locks---because these are the lines that all hosts contend on and whose ownership transfers traverse the CXL fabric. Future work along this direction should target the \emph{sharing pattern} rather than the access latency: per-host hot copies, sharded locks, or write-delegation schemes are all ways to remove the contended-line traffic that we observed dominating the \texttt{split} topology.
+
+\subsection{Limitations}
+We emulate CXL with UPI, which approximates CXL.mem's latency class but not its bandwidth ceiling, asymmetric load/store behaviour, or device-side buffering. We measure on a single host, so we cannot capture the effect of having more than two compute hosts contending on the same memory pool. Our YCSB working set fits in a single socket's L3; a working set that exceeds L3 would re-introduce the local-vs-remote DRAM-latency gap that our results currently render invisible. Each measurement window is 0.8~s effective, giving a $\pm$2--3\% noise floor; placement deltas below that floor (such as the 0.6\% remote-vs-local gap on workload~A) should be read as ``statistically tied,'' not as signal.
+
+\section{Conclusion}
+We reproduced \textsc{Chime} on a real RDMA cluster and ported the same codebase to an emulated CXL substrate. The reproduction validated the original system's headline number (12.98~Mops on YCSB-A across a 3-node \texttt{r650} cluster). The CXL port reaches 0.27~Mops/thread on the same workload---a 1.5--2.2$\times$ per-thread improvement depending on the comparison point---and exposes a finding that we believe is the most important takeaway of the project: under a coherent fabric and with a working set that fits in last-level cache, raw remote-DRAM latency is invisible at the throughput level, and the dominant cost shifts to inter-socket cache-coherence traffic on the small set of hot tree lines. This reframes which of \textsc{Chime}'s contributions remain useful (hopscotch leaves, \textsc{Valock}, sibling validation) and which become redundant (metadata replication), and suggests that the next generation of CXL-native DM indexes should target sharing patterns rather than per-op latency.
+
+\end{document}
